@@ -5,9 +5,9 @@ import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.MMapDirectory;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
-import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
@@ -23,16 +23,27 @@ public class Main {
 
     private static volatile boolean testCompleted = false;
     private static long pid;
-    private static String directoryPath;
+    private static final String TEST_FILE_NAME = "_1q_Lucene101_0.doc";
+    private static final String TEST_FILE_SIZE = "100G";
 
     public static void main(final String... args) throws InterruptedException {
-        // Parse command line arguments
-        parseArguments(args);
-
         // Get PID in main method
         pid = ProcessHandle.current().pid();
         System.out.println("Main thread PID: " + pid);
-        System.out.println("Using directory path: " + directoryPath);
+
+        // Get current working directory
+        String currentDir = System.getProperty("user.dir");
+        System.out.println("Working directory: " + currentDir);
+        System.out.println("Test file: " + TEST_FILE_NAME + " (" + TEST_FILE_SIZE + ")");
+
+        // Create test file if it doesn't exist
+        try {
+            createTestFileIfNeeded(currentDir);
+        } catch (Exception e) {
+            System.err.println("Failed to create test file: " + e.getMessage());
+            e.printStackTrace();
+            return;
+        }
 
         // Keep main method minimal to avoid variables showing up in heap dump
         Thread testThread = new Thread(Main::runTest, "Main-Test-Thread");
@@ -76,37 +87,45 @@ public class Main {
         }
     }
 
-    private static void parseArguments(String[] args) {
-        // Default directory path
-        String defaultPath = "/Users/ssashish/dev/docker/opensearch/opensearch-1m2d-s3-data1/nodes/0/_state";
+    private static void createTestFileIfNeeded(String directory) throws IOException, InterruptedException {
+        File testFile = new File(directory, TEST_FILE_NAME);
 
-        if (args.length > 0 && args[0] != null && !args[0].trim().isEmpty()) {
-            directoryPath = args[0].trim();
-            System.out.println("Using provided directory path: " + directoryPath);
-        } else {
-            directoryPath = defaultPath;
-            System.out.println("No directory path provided, using default: " + directoryPath);
+        if (testFile.exists()) {
+            long fileSizeGB = testFile.length() / (1024L * 1024L * 1024L);
+            System.out.println("Test file already exists: " + testFile.getAbsolutePath());
+            System.out.println("File size: ~" + fileSizeGB + " GB (" + testFile.length() + " bytes)");
+            return;
         }
 
-        // Validate that the path exists
-        try {
-            Path path = Paths.get(directoryPath);
-            if (!path.toFile().exists()) {
-                System.err.println("WARNING: Directory does not exist: " + directoryPath);
-            } else if (!path.toFile().isDirectory()) {
-                System.err.println("WARNING: Path is not a directory: " + directoryPath);
-            } else {
-                System.out.println("Directory validated successfully: " + directoryPath);
+        System.out.println("Creating test file: " + testFile.getAbsolutePath());
+        System.out.println("Size: " + TEST_FILE_SIZE + " (this may take a moment...)");
+
+        // Use fallocate to create a sparse 100GB file
+        ProcessBuilder pb = new ProcessBuilder("fallocate", "-l", TEST_FILE_SIZE, testFile.getAbsolutePath());
+        Process process = pb.start();
+
+        // Capture output
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+             BufferedReader errorReader = new BufferedReader(new InputStreamReader(process.getErrorStream()))) {
+
+            String line;
+            while ((line = reader.readLine()) != null) {
+                System.out.println("FALLOCATE: " + line);
             }
-        } catch (Exception e) {
-            System.err.println("ERROR: Invalid directory path: " + directoryPath + " - " + e.getMessage());
+
+            while ((line = errorReader.readLine()) != null) {
+                System.err.println("FALLOCATE ERROR: " + line);
+            }
         }
 
-        // Print usage information
-        if (args.length == 0) {
-            System.out.println("\nUsage: java -jar target/lucene-test-1.0-SNAPSHOT.jar [directory_path]");
-            System.out.println("  directory_path: Optional path to Lucene index directory");
-            System.out.println("  If not provided, uses: " + defaultPath);
+        int exitCode = process.waitFor();
+
+        if (exitCode == 0) {
+            System.out.println("Test file created successfully!");
+            long fileSizeGB = testFile.length() / (1024L * 1024L * 1024L);
+            System.out.println("File size: ~" + fileSizeGB + " GB (" + testFile.length() + " bytes)");
+        } else {
+            throw new IOException("fallocate command failed with exit code: " + exitCode);
         }
     }
 
@@ -169,12 +188,13 @@ public class Main {
         printVmmap(pid, "INITIAL STATE - Before opening any files");
         printMemoryInfo("INITIAL MEMORY STATE", createdCount);
 
-        // Use the directory path from command line argument (or default)
-        String fileName = "_1q_Lucene101_0.doc";
-        MMapDirectory dir = new MMapDirectory(Path.of(directoryPath));
+        // Use current working directory and the test file
+        String currentDir = System.getProperty("user.dir");
+        MMapDirectory dir = new MMapDirectory(Paths.get(currentDir));
 
-        System.out.println("\n=== Starting IndexInput creation test with file: " + fileName + " ===");
-        System.out.println("Directory: " + directoryPath);
+        System.out.println("\n=== Starting IndexInput creation test with file: " + TEST_FILE_NAME + " ===");
+        System.out.println("Directory: " + currentDir);
+        System.out.println("File size: " + TEST_FILE_SIZE);
         System.out.println("Creating IndexInputs in executor threads WITHOUT closing them");
         System.out.println("NOT holding references - allowing GC to potentially clean them up");
 
@@ -187,7 +207,7 @@ public class Main {
             Future<Void> future = executor.submit(() -> {
                 try {
                     // Create IndexInput in executor thread
-                    IndexInput indexInput = dir.openInput(fileName, IOContext.DEFAULT);
+                    IndexInput indexInput = dir.openInput(TEST_FILE_NAME, IOContext.DEFAULT);
 
                     // Touch some data to ensure it's actually used
                     indexInput.seek(0);
