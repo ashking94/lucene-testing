@@ -8,6 +8,7 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
@@ -26,10 +27,17 @@ public class Main {
     private static final String TEST_FILE_NAME = "_1q_Lucene101_0.doc";
     private static final String TEST_FILE_SIZE = "100G";
 
+    // OS Detection
+    private static final String OS_NAME = System.getProperty("os.name").toLowerCase();
+    private static final boolean IS_LINUX = OS_NAME.contains("linux");
+    private static final boolean IS_MAC = OS_NAME.contains("mac") || OS_NAME.contains("darwin");
+    private static final boolean IS_WINDOWS = OS_NAME.contains("windows");
+
     public static void main(final String... args) throws InterruptedException {
         // Get PID in main method
         pid = ProcessHandle.current().pid();
         System.out.println("Main thread PID: " + pid);
+        System.out.println("Operating System: " + OS_NAME);
 
         // Get current working directory
         String currentDir = System.getProperty("user.dir");
@@ -100,8 +108,88 @@ public class Main {
         System.out.println("Creating test file: " + testFile.getAbsolutePath());
         System.out.println("Size: " + TEST_FILE_SIZE + " (this may take a moment...)");
 
-        // Use fallocate to create a sparse 100GB file
-        ProcessBuilder pb = new ProcessBuilder("fallocate", "-l", TEST_FILE_SIZE, testFile.getAbsolutePath());
+        boolean success = false;
+
+        if (IS_LINUX) {
+            success = createFileLinux(testFile);
+        } else if (IS_MAC) {
+            success = createFileMac(testFile);
+        } else if (IS_WINDOWS) {
+            success = createFileWindows(testFile);
+        } else {
+            System.err.println("Unsupported operating system: " + OS_NAME);
+            System.err.println("Attempting to use dd command as fallback...");
+            success = createFileWithDD(testFile);
+        }
+
+        if (!success) {
+            throw new IOException("Failed to create test file using all available methods");
+        }
+
+        // Verify file creation
+        if (testFile.exists()) {
+            long fileSizeGB = testFile.length() / (1024L * 1024L * 1024L);
+            System.out.println("Test file created successfully!");
+            System.out.println("File size: ~" + fileSizeGB + " GB (" + testFile.length() + " bytes)");
+        } else {
+            throw new IOException("Test file was not created successfully");
+        }
+    }
+
+    private static boolean createFileLinux(File testFile) {
+        try {
+            System.out.println("Using Linux fallocate command...");
+            ProcessBuilder pb = new ProcessBuilder("fallocate", "-l", TEST_FILE_SIZE, testFile.getAbsolutePath());
+            return executeCommand(pb, "FALLOCATE");
+        } catch (Exception e) {
+            System.err.println("Linux fallocate failed: " + e.getMessage());
+            System.err.println("Trying dd command as fallback...");
+            return createFileWithDD(testFile);
+        }
+    }
+
+    private static boolean createFileMac(File testFile) {
+        try {
+            System.out.println("Using macOS mkfile command...");
+            // mkfile uses lowercase 'g' for gigabytes
+            ProcessBuilder pb = new ProcessBuilder("mkfile", "-n", "100g", testFile.getAbsolutePath());
+            return executeCommand(pb, "MKFILE");
+        } catch (Exception e) {
+            System.err.println("macOS mkfile failed: " + e.getMessage());
+            System.err.println("Trying dd command as fallback...");
+            return createFileWithDD(testFile);
+        }
+    }
+
+    private static boolean createFileWindows(File testFile) {
+        try {
+            System.out.println("Using Windows fsutil command...");
+            // fsutil requires size in bytes (100GB = 107374182400 bytes)
+            ProcessBuilder pb = new ProcessBuilder("fsutil", "file", "createnew",
+                    testFile.getAbsolutePath(), "107374182400");
+            return executeCommand(pb, "FSUTIL");
+        } catch (Exception e) {
+            System.err.println("Windows fsutil failed: " + e.getMessage());
+            System.err.println("Trying dd command as fallback...");
+            return createFileWithDD(testFile);
+        }
+    }
+
+    private static boolean createFileWithDD(File testFile) {
+        try {
+            System.out.println("Using dd command (universal fallback)...");
+            // Create 100GB file with dd (100 * 1024 = 102400 blocks of 1MB each)
+            ProcessBuilder pb = new ProcessBuilder("dd", "if=/dev/zero",
+                    "of=" + testFile.getAbsolutePath(),
+                    "bs=1M", "count=102400");
+            return executeCommand(pb, "DD");
+        } catch (Exception e) {
+            System.err.println("DD command failed: " + e.getMessage());
+            return false;
+        }
+    }
+
+    private static boolean executeCommand(ProcessBuilder pb, String commandName) throws IOException, InterruptedException {
         Process process = pb.start();
 
         // Capture output
@@ -110,22 +198,22 @@ public class Main {
 
             String line;
             while ((line = reader.readLine()) != null) {
-                System.out.println("FALLOCATE: " + line);
+                System.out.println(commandName + ": " + line);
             }
 
             while ((line = errorReader.readLine()) != null) {
-                System.err.println("FALLOCATE ERROR: " + line);
+                System.err.println(commandName + " ERROR: " + line);
             }
         }
 
         int exitCode = process.waitFor();
 
         if (exitCode == 0) {
-            System.out.println("Test file created successfully!");
-            long fileSizeGB = testFile.length() / (1024L * 1024L * 1024L);
-            System.out.println("File size: ~" + fileSizeGB + " GB (" + testFile.length() + " bytes)");
+            System.out.println(commandName + " completed successfully!");
+            return true;
         } else {
-            throw new IOException("fallocate command failed with exit code: " + exitCode);
+            System.err.println(commandName + " failed with exit code: " + exitCode);
+            return false;
         }
     }
 
@@ -200,7 +288,7 @@ public class Main {
 
         List<Future<Void>> futures = new ArrayList<>();
 
-        for (int i = 0; i < 100000; i++) {
+        for (int i = 0; i < 5000; i++) {
             final int iteration = i;
 
             // Submit task to create IndexInput but NOT close it and NOT hold reference
@@ -359,8 +447,16 @@ public class Main {
         System.out.println("=".repeat(60));
 
         try {
-            ProcessBuilder pb = new ProcessBuilder("bash", "-c",
-                    "vmmap --wide " + pid + " | grep '_1q_Lucene101_0'");
+            ProcessBuilder pb;
+            if (IS_MAC) {
+                pb = new ProcessBuilder("bash", "-c", "vmmap --wide " + pid + " | grep '_1q_Lucene101_0'");
+            } else if (IS_LINUX) {
+                pb = new ProcessBuilder("bash", "-c", "cat /proc/" + pid + "/maps | grep '_1q_Lucene101_0'");
+            } else {
+                System.out.println("Memory mapping inspection not supported on " + OS_NAME);
+                return;
+            }
+
             Process process = pb.start();
 
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
@@ -380,7 +476,7 @@ public class Main {
             process.waitFor();
 
         } catch (Exception e) {
-            System.err.println("Error executing vmmap command: " + e.getMessage());
+            System.err.println("Error executing memory mapping command: " + e.getMessage());
             e.printStackTrace();
         }
 
