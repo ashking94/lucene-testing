@@ -8,10 +8,13 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
-import java.nio.file.Path;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -78,7 +81,7 @@ public class Main {
 
             // Perform GC every 30 seconds
             if (i % 30 == 0 && i > 0) {
-                System.out.println("\n=== Periodic GC cycle " + (i/30) + " ===");
+                System.out.println("\n=== Periodic GC cycle " + (i / 30) + " ===");
                 long beforeGC = getUsedMemory();
                 System.gc();
                 Thread.sleep(500); // Give GC time
@@ -90,7 +93,7 @@ public class Main {
 
             // Print status every minute
             if (i % 60 == 0 && i > 0) {
-                System.out.println("Main thread still alive after " + (i/60) + " minute(s), memory used: " + getUsedMemory() + " MB");
+                System.out.println("Main thread still alive after " + (i / 60) + " minute(s), memory used: " + getUsedMemory() + " MB");
             }
         }
     }
@@ -227,7 +230,7 @@ public class Main {
 
         for (int i = 0; i < 5; i++) {
             long beforeGC = getUsedMemory();
-            System.out.println("GC cycle " + (i+1) + "/5 - Memory before: " + beforeGC + " MB");
+            System.out.println("GC cycle " + (i + 1) + "/5 - Memory before: " + beforeGC + " MB");
 
             System.gc();
 
@@ -238,7 +241,7 @@ public class Main {
             }
 
             long afterGC = getUsedMemory();
-            System.out.println("GC cycle " + (i+1) + "/5 - Memory after: " + afterGC + " MB, freed: " + (beforeGC - afterGC) + " MB");
+            System.out.println("GC cycle " + (i + 1) + "/5 - Memory after: " + afterGC + " MB, freed: " + (beforeGC - afterGC) + " MB");
         }
 
         // Take heap dump after aggressive GC
@@ -288,7 +291,7 @@ public class Main {
 
         List<Future<Void>> futures = new ArrayList<>();
 
-        for (int i = 0; i < 5000; i++) {
+        for (int i = 0; i < 3000; i++) {
             final int iteration = i;
 
             // Submit task to create IndexInput but NOT close it and NOT hold reference
@@ -328,16 +331,22 @@ public class Main {
             futures.add(future);
 
             // Print vmmap at specific intervals
-            if (i % 10000 == 0) {
+            if (i % 500 == 0) {
                 printVmmap(pid, "ITERATION " + i + " - Created " + createdCount.get() + " IndexInputs (no references held)");
                 printMemoryInfo("ITERATION " + i + " MEMORY STATE", createdCount);
             }
 
             // Add a small delay every 100 iterations
             if (i % 100 == 0 && i > 0) {
-                Thread.sleep(10);
+                Thread.sleep(1000);
             }
         }
+
+        System.out.println("\n=== Waiting for all IndexInput creation tasks to complete ===");
+
+        // Map to track unique exceptions
+        Map<String, ExceptionInfo> exceptionMap = new ConcurrentHashMap<>();
+        int totalExceptions = 0;
 
         System.out.println("\n=== Waiting for all IndexInput creation tasks to complete ===");
 
@@ -346,10 +355,22 @@ public class Main {
             try {
                 future.get();
             } catch (Exception e) {
-                System.err.println("Error in IndexInput creation task: " + e.getMessage());
-                e.printStackTrace();
+                totalExceptions++;
+                String exceptionKey = e.getClass().getSimpleName() + ":" + (e.getMessage() != null ? e.getMessage() : "null");
+
+                exceptionMap.computeIfAbsent(exceptionKey, k -> new ExceptionInfo(e))
+                        .incrementCount();
+
+                // Only print immediate error for first few exceptions or every 1000th exception
+                if (totalExceptions <= 5 || totalExceptions % 1000 == 0) {
+                    System.err.println("Exception #" + totalExceptions + ": " + e.getClass().getSimpleName() + " - " + e.getMessage());
+                }
             }
         }
+
+        // Print exception summary
+        printExceptionSummary(exceptionMap, totalExceptions);
+
 
         System.out.println("Total IndexInputs created: " + createdCount.get());
 
@@ -385,6 +406,42 @@ public class Main {
         printMemoryInfo("FINAL MEMORY STATE - Test thread", createdCount);
     }
 
+    private static void printExceptionSummary(Map<String, ExceptionInfo> exceptionMap, int totalExceptions) {
+        if (totalExceptions == 0) {
+            System.out.println("All IndexInput creation tasks completed successfully!");
+            return;
+        }
+
+        System.out.println("\n" + "=".repeat(70));
+        System.out.println("EXCEPTION SUMMARY");
+        System.out.println("=".repeat(70));
+        System.out.println("Total exceptions encountered: " + totalExceptions);
+        System.out.println("Unique exception types: " + exceptionMap.size());
+        System.out.println();
+
+        // Sort exceptions by count (most frequent first)
+        exceptionMap.entrySet().stream()
+                .sorted((e1, e2) -> Integer.compare(e2.getValue().getCount(), e1.getValue().getCount()))
+                .forEach(entry -> {
+                    ExceptionInfo info = entry.getValue();
+                    System.out.println("Exception Type: " + entry.getKey());
+                    System.out.println("Count: " + info.getCount() + " occurrences");
+                    System.out.println("Message: " + (info.getMessage() != null ? info.getMessage() : "No message"));
+
+                    // Only print stack trace for exceptions that occurred less frequently
+                    // or if there are very few unique exception types
+                    if (info.getCount() <= 10 || exceptionMap.size() <= 3) {
+                        System.out.println("Stack Trace:");
+                        System.out.println(info.getStackTrace());
+                    } else {
+                        System.out.println("Stack Trace: [Suppressed - occurred " + info.getCount() + " times]");
+                    }
+                    System.out.println("-".repeat(50));
+                });
+
+        System.out.println("=".repeat(70));
+    }
+
     private static void printMemoryInfo(String label, AtomicInteger createdCount) {
         Runtime runtime = Runtime.getRuntime();
         long totalMemory = runtime.totalMemory();
@@ -392,16 +449,286 @@ public class Main {
         long usedMemory = totalMemory - freeMemory;
         long maxMemory = runtime.maxMemory();
 
-        System.out.println("\n" + "-".repeat(40));
+        System.out.println("\n" + "-".repeat(60));
         System.out.println("MEMORY INFO - " + label);
         System.out.println("Thread: " + Thread.currentThread().getName());
-        System.out.println("-".repeat(40));
+        System.out.println("-".repeat(60));
+
+        // Java Heap Memory Info
+        System.out.println("=== Java Heap Memory ===");
         System.out.println("Used Memory: " + (usedMemory / 1024 / 1024) + " MB");
         System.out.println("Free Memory: " + (freeMemory / 1024 / 1024) + " MB");
         System.out.println("Total Memory: " + (totalMemory / 1024 / 1024) + " MB");
         System.out.println("Max Memory: " + (maxMemory / 1024 / 1024) + " MB");
         System.out.println("IndexInputs created: " + createdCount.get());
-        System.out.println("-".repeat(40));
+
+        // Add Linux-specific information
+        if (IS_LINUX) {
+            printLinuxSystemInfo();
+            printLinuxProcessLimits();
+            printLinuxFileDescriptorInfo();
+        } else if (IS_MAC) {
+            printMacSystemInfo();
+        } else {
+            System.out.println("=== OS-Specific Info ===");
+            System.out.println("Detailed system info not available for: " + OS_NAME);
+        }
+
+        System.out.println("-".repeat(60));
+    }
+
+    private static void printLinuxSystemInfo() {
+        System.out.println("=== Linux Process Memory Info ===");
+
+        try {
+            // Read /proc/<pid>/status for VmPeak, VmSize, VmRSS, etc.
+            String statusFile = "/proc/" + pid + "/status";
+            ProcessBuilder pb = new ProcessBuilder("grep", "-E",
+                    "VmPeak|VmSize|VmRSS|VmHWM|VmData|VmStk|VmExe|VmLib|Threads", statusFile);
+            Process process = pb.start();
+
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    // Format the output nicely
+                    if (line.contains("VmPeak")) {
+                        System.out.println("Peak Virtual Memory: " + formatLinuxMemory(line));
+                    } else if (line.contains("VmSize")) {
+                        System.out.println("Current Virtual Memory: " + formatLinuxMemory(line));
+                    } else if (line.contains("VmRSS")) {
+                        System.out.println("Resident Set Size: " + formatLinuxMemory(line));
+                    } else if (line.contains("VmHWM")) {
+                        System.out.println("Peak Resident Memory: " + formatLinuxMemory(line));
+                    } else if (line.contains("VmData")) {
+                        System.out.println("Data Segment Size: " + formatLinuxMemory(line));
+                    } else if (line.contains("VmStk")) {
+                        System.out.println("Stack Size: " + formatLinuxMemory(line));
+                    } else if (line.contains("Threads")) {
+                        System.out.println("Thread Count: " + line.split("\\s+")[1]);
+                    }
+                }
+            }
+
+            process.waitFor();
+
+        } catch (Exception e) {
+            System.err.println("Error reading Linux process status: " + e.getMessage());
+        }
+
+        // Read system-wide limits
+        System.out.println("=== Linux System Limits ===");
+        try {
+            // Max memory mappings system-wide
+            String maxMapCount = readLinuxSysctl("/proc/sys/vm/max_map_count");
+            if (maxMapCount != null) {
+                System.out.println("System Max Memory Maps: " + maxMapCount);
+            }
+
+            // Max file descriptors system-wide
+            String maxFiles = readLinuxSysctl("/proc/sys/fs/file-max");
+            if (maxFiles != null) {
+                System.out.println("System Max File Descriptors: " + maxFiles);
+            }
+
+            // Current open files system-wide
+            String openFiles = readLinuxSysctl("/proc/sys/fs/file-nr");
+            if (openFiles != null) {
+                String[] parts = openFiles.split("\\s+");
+                if (parts.length >= 2) {
+                    System.out.println("System Open Files: " + parts[0] + " (allocated: " + parts[1] + ")");
+                }
+            }
+
+        } catch (Exception e) {
+            System.err.println("Error reading Linux system limits: " + e.getMessage());
+        }
+    }
+
+    private static void printLinuxProcessLimits() {
+        System.out.println("=== Linux Process Limits ===");
+
+        try {
+            String limitsFile = "/proc/" + pid + "/limits";
+            ProcessBuilder pb = new ProcessBuilder("grep", "-E",
+                    "Max open files|Max address space|Max memory|Max processes", limitsFile);
+            Process process = pb.start();
+
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    // Clean up the output format
+                    String[] parts = line.split("\\s+", 4);
+                    if (parts.length >= 4) {
+                        String limitType = parts[0] + " " + parts[1] + " " + parts[2];
+                        String softLimit = parts[3];
+                        System.out.println(limitType + ": " + softLimit);
+                    }
+                }
+            }
+
+            process.waitFor();
+
+        } catch (Exception e) {
+            System.err.println("Error reading Linux process limits: " + e.getMessage());
+        }
+    }
+
+    private static void printLinuxFileDescriptorInfo() {
+        System.out.println("=== Linux File Descriptor Info ===");
+
+        try {
+            // Count current file descriptors
+            String fdDir = "/proc/" + pid + "/fd";
+            ProcessBuilder pb = new ProcessBuilder("ls", "-1", fdDir);
+            Process process = pb.start();
+
+            int fdCount = 0;
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                while (reader.readLine() != null) {
+                    fdCount++;
+                }
+            }
+
+            System.out.println("Current Open File Descriptors: " + fdCount);
+
+            process.waitFor();
+
+            // Count memory mappings
+            String mapsFile = "/proc/" + pid + "/maps";
+            pb = new ProcessBuilder("wc", "-l", mapsFile);
+            process = pb.start();
+
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line = reader.readLine();
+                if (line != null) {
+                    String mappingCount = line.trim().split("\\s+")[0];
+                    System.out.println("Total Memory Mappings: " + mappingCount);
+                }
+            }
+
+            process.waitFor();
+
+        } catch (Exception e) {
+            System.err.println("Error reading Linux file descriptor info: " + e.getMessage());
+        }
+    }
+
+    private static void printMacSystemInfo() {
+        System.out.println("=== macOS System Info ===");
+
+        try {
+            // Get memory pressure information
+            ProcessBuilder pb = new ProcessBuilder("memory_pressure");
+            Process process = pb.start();
+
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (line.contains("pressure:")) {
+                        System.out.println("Memory Pressure: " + line.trim());
+                    }
+                }
+            }
+
+            process.waitFor();
+
+        } catch (Exception e) {
+            // memory_pressure might not be available, try vm_stat
+            try {
+                ProcessBuilder pb2 = new ProcessBuilder("vm_stat");
+                Process process2 = pb2.start();
+
+                System.out.println("VM Statistics:");
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(process2.getInputStream()))) {
+                    String line;
+                    int lineCount = 0;
+                    while ((line = reader.readLine()) != null && lineCount < 5) {
+                        if (line.contains("Pages") && (line.contains("free") || line.contains("active") || line.contains("inactive"))) {
+                            System.out.println("  " + line.trim());
+                            lineCount++;
+                        }
+                    }
+                }
+
+                process2.waitFor();
+
+            } catch (Exception e2) {
+                System.err.println("Error reading macOS system info: " + e2.getMessage());
+            }
+        }
+
+        // Get file descriptor info for macOS
+        try {
+            ProcessBuilder pb = new ProcessBuilder("lsof", "-p", String.valueOf(pid));
+            Process process = pb.start();
+
+            int fdCount = 0;
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                boolean isFirst = true;
+                while ((line = reader.readLine()) != null) {
+                    if (isFirst) {
+                        isFirst = false; // Skip header
+                        continue;
+                    }
+                    fdCount++;
+                }
+            }
+
+            System.out.println("Open File Descriptors (lsof): " + fdCount);
+
+            process.waitFor();
+
+        } catch (Exception e) {
+            System.err.println("Error reading macOS file descriptor info: " + e.getMessage());
+        }
+    }
+
+    private static String readLinuxSysctl(String filePath) {
+        try {
+            ProcessBuilder pb = new ProcessBuilder("cat", filePath);
+            Process process = pb.start();
+
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line = reader.readLine();
+                if (line != null) {
+                    return line.trim();
+                }
+            }
+
+            process.waitFor();
+
+        } catch (Exception e) {
+            // Silently fail for optional information
+        }
+
+        return null;
+    }
+
+    private static String formatLinuxMemory(String line) {
+        try {
+            String[] parts = line.split("\\s+");
+            if (parts.length >= 3) {
+                long valueKB = Long.parseLong(parts[1]);
+                String unit = parts[2];
+
+                if ("kB".equals(unit)) {
+                    if (valueKB < 1024) {
+                        return valueKB + " KB";
+                    } else if (valueKB < 1024 * 1024) {
+                        return String.format("%.2f MB", valueKB / 1024.0);
+                    } else {
+                        return String.format("%.2f GB", valueKB / (1024.0 * 1024.0));
+                    }
+                }
+            }
+
+            // Fallback to original format
+            return line.substring(line.indexOf(':') + 1).trim();
+
+        } catch (Exception e) {
+            return line.substring(line.indexOf(':') + 1).trim();
+        }
     }
 
     private static void takeHeapDump(long pid) {
@@ -448,12 +775,17 @@ public class Main {
 
         try {
             ProcessBuilder pb;
+            String commandDescription;
+
             if (IS_MAC) {
                 pb = new ProcessBuilder("bash", "-c", "vmmap --wide " + pid + " | grep '_1q_Lucene101_0'");
+                commandDescription = "vmmap (macOS)";
             } else if (IS_LINUX) {
                 pb = new ProcessBuilder("bash", "-c", "cat /proc/" + pid + "/maps | grep '_1q_Lucene101_0'");
+                commandDescription = "proc/maps (Linux)";
             } else {
                 System.out.println("Memory mapping inspection not supported on " + OS_NAME);
+                System.out.println("=".repeat(60));
                 return;
             }
 
@@ -461,19 +793,69 @@ public class Main {
 
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
                 String line;
-                boolean foundMappings = false;
+                int mappingCount = 0;
+                long totalSizeKB = 0; // Track total virtual size if possible
 
                 while ((line = reader.readLine()) != null) {
-                    foundMappings = true;
-                    System.out.println(line);
+                    mappingCount++;
+
+                    // Try to extract size information for additional context
+                    if (IS_MAC && line.contains("[") && line.contains("]")) {
+                        // macOS format: [...[ 48K    48K     0K     0K] ...]
+                        try {
+                            String sizeSection = line.substring(line.indexOf('[') + 1, line.indexOf(']'));
+                            String[] parts = sizeSection.trim().split("\\s+");
+                            if (parts.length > 0) {
+                                String sizeStr = parts[0].trim();
+                                if (sizeStr.endsWith("K")) {
+                                    totalSizeKB += Long.parseLong(sizeStr.replace("K", ""));
+                                } else if (sizeStr.endsWith("M")) {
+                                    totalSizeKB += Long.parseLong(sizeStr.replace("M", "")) * 1024;
+                                } else if (sizeStr.endsWith("G")) {
+                                    totalSizeKB += Long.parseLong(sizeStr.replace("G", "")) * 1024 * 1024;
+                                }
+                            }
+                        } catch (Exception e) {
+                            // Ignore parsing errors, just count the mappings
+                        }
+                    }
                 }
 
-                if (!foundMappings) {
+                if (mappingCount > 0) {
+                    System.out.println("Found " + mappingCount + " memory mapping(s) for '_1q_Lucene101_0' file");
+                    if (IS_MAC && totalSizeKB > 0) {
+                        if (totalSizeKB < 1024) {
+                            System.out.println("Total mapped size: ~" + totalSizeKB + " KB");
+                        } else if (totalSizeKB < 1024 * 1024) {
+                            System.out.println("Total mapped size: ~" + String.format("%.2f", totalSizeKB / 1024.0) + " MB");
+                        } else {
+                            System.out.println("Total mapped size: ~" + String.format("%.2f", totalSizeKB / (1024.0 * 1024.0)) + " GB");
+                        }
+                    }
+                    System.out.println("Command used: " + commandDescription);
+                } else {
                     System.out.println("No mappings found for '_1q_Lucene101_0' files");
+                    System.out.println("Command used: " + commandDescription);
                 }
             }
 
-            process.waitFor();
+            // Check for errors
+            try (BufferedReader errorReader = new BufferedReader(new InputStreamReader(process.getErrorStream()))) {
+                String errorLine;
+                boolean hasErrors = false;
+                while ((errorLine = errorReader.readLine()) != null) {
+                    if (!hasErrors) {
+                        System.out.println("Command errors:");
+                        hasErrors = true;
+                    }
+                    System.err.println("  " + errorLine);
+                }
+            }
+
+            int exitCode = process.waitFor();
+            if (exitCode != 0) {
+                System.err.println("Command failed with exit code: " + exitCode);
+            }
 
         } catch (Exception e) {
             System.err.println("Error executing memory mapping command: " + e.getMessage());
@@ -481,5 +863,40 @@ public class Main {
         }
 
         System.out.println("=".repeat(60));
+    }
+}
+
+class ExceptionInfo {
+    private final String message;
+    private final String stackTrace;
+    private int count;
+
+    public ExceptionInfo(Exception e) {
+        this.message = e.getMessage();
+        this.stackTrace = getStackTraceAsString(e);
+        this.count = 1;
+    }
+
+    public void incrementCount() {
+        this.count++;
+    }
+
+    public int getCount() {
+        return count;
+    }
+
+    public String getMessage() {
+        return message;
+    }
+
+    public String getStackTrace() {
+        return stackTrace;
+    }
+
+    private static String getStackTraceAsString(Exception e) {
+        StringWriter sw = new StringWriter();
+        PrintWriter pw = new PrintWriter(sw);
+        e.printStackTrace(pw);
+        return sw.toString();
     }
 }
