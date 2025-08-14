@@ -6,12 +6,15 @@ import org.apache.lucene.store.MMapDirectory;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.nio.file.Paths;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -73,7 +76,7 @@ public class Main {
 
         // Keep the process alive for heap dump analysis
         System.out.println("Keeping process alive for heap dump analysis...");
-        System.out.println("Press Ctrl+C to exit or take heap dump now with: jcmd " + pid + " Heap.dump heap_dump_" + System.currentTimeMillis() + ".hprof");
+        System.out.println("Press Ctrl+C to exit or take heap dump now with: jcmd " + pid + " GC.heap_dump" + System.currentTimeMillis() + ".hprof");
 
         // Sleep with periodic GC and logging
         for (int i = 0; i < 300; i++) { // 5 minutes total
@@ -316,7 +319,7 @@ public class Main {
                     // This allows the IndexInput object to become eligible for GC
                     // But the question is: will the underlying memory mapping remain?
 
-                    if (iteration % 1000 == 0) {
+                    if (iteration % 100 == 0) {
                         System.out.println("Thread " + Thread.currentThread().getName() +
                                 " created IndexInput #" + iteration +
                                 " (Total created: " + count + ")");
@@ -331,7 +334,7 @@ public class Main {
             futures.add(future);
 
             // Print vmmap at specific intervals
-            if (i % 500 == 0) {
+            if (i % 100 == 0) {
                 printVmmap(pid, "ITERATION " + i + " - Created " + createdCount.get() + " IndexInputs (no references held)");
                 printMemoryInfo("ITERATION " + i + " MEMORY STATE", createdCount);
             }
@@ -362,7 +365,7 @@ public class Main {
                         .incrementCount();
 
                 // Only print immediate error for first few exceptions or every 1000th exception
-                if (totalExceptions <= 5 || totalExceptions % 1000 == 0) {
+                if (totalExceptions % 100 == 0) {
                     System.err.println("Exception #" + totalExceptions + ": " + e.getClass().getSimpleName() + " - " + e.getMessage());
                 }
             }
@@ -371,6 +374,8 @@ public class Main {
         // Print exception summary
         printExceptionSummary(exceptionMap, totalExceptions);
 
+        // Capture detailed system state to file
+        captureSystemStateToFile("AFTER_ALL_INDEXINPUT_CREATION", createdCount);
 
         System.out.println("Total IndexInputs created: " + createdCount.get());
 
@@ -864,6 +869,355 @@ public class Main {
 
         System.out.println("=".repeat(60));
     }
+
+    private static void captureSystemStateToFile(String label, AtomicInteger createdCount) {
+        String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
+        String fileName = "system_state_" + label + "_" + timestamp + ".txt";
+
+        try (PrintWriter writer = new PrintWriter(new FileWriter(fileName))) {
+            writer.println("=".repeat(80));
+            writer.println("SYSTEM STATE CAPTURE - " + label);
+            writer.println("Timestamp: " + new Date());
+            writer.println("PID: " + pid);
+            writer.println("OS: " + OS_NAME);
+            writer.println("=".repeat(80));
+            writer.println();
+
+            // 1. Memory Information
+            captureMemoryInfoToFile(writer, "DETAILED MEMORY INFO", createdCount);
+
+            // 2. Virtual Memory Mappings
+            captureVmmapToFile(writer, "VIRTUAL MEMORY MAPPINGS");
+
+            // 3. Process Memory Map (pmap -x for Linux, vmmap for Mac)
+            captureProcessMemoryMapToFile(writer, "PROCESS MEMORY MAP");
+
+            // 4. File Descriptor Information
+            captureFileDescriptorInfoToFile(writer, "FILE DESCRIPTOR INFO");
+
+            // 5. System Limits
+            captureSystemLimitsToFile(writer, "SYSTEM LIMITS");
+
+            writer.println("\n" + "=".repeat(80));
+            writer.println("END OF SYSTEM STATE CAPTURE");
+            writer.println("=".repeat(80));
+
+            System.out.println("System state captured to file: " + fileName);
+
+        } catch (IOException e) {
+            System.err.println("Failed to write system state to file: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    private static void captureMemoryInfoToFile(PrintWriter writer, String label, AtomicInteger createdCount) {
+        writer.println("=== " + label + " ===");
+
+        Runtime runtime = Runtime.getRuntime();
+        long totalMemory = runtime.totalMemory();
+        long freeMemory = runtime.freeMemory();
+        long usedMemory = totalMemory - freeMemory;
+        long maxMemory = runtime.maxMemory();
+
+        writer.println("Thread: " + Thread.currentThread().getName());
+        writer.println();
+
+        // Java Heap Memory Info
+        writer.println("=== Java Heap Memory ===");
+        writer.println("Used Memory: " + (usedMemory / 1024 / 1024) + " MB");
+        writer.println("Free Memory: " + (freeMemory / 1024 / 1024) + " MB");
+        writer.println("Total Memory: " + (totalMemory / 1024 / 1024) + " MB");
+        writer.println("Max Memory: " + (maxMemory / 1024 / 1024) + " MB");
+        writer.println("IndexInputs created: " + createdCount.get());
+        writer.println();
+
+        // Add Linux-specific information
+        if (IS_LINUX) {
+            captureLinuxSystemInfoToFile(writer);
+        } else if (IS_MAC) {
+            captureMacSystemInfoToFile(writer);
+        }
+
+        writer.println();
+    }
+
+    private static void captureLinuxSystemInfoToFile(PrintWriter writer) {
+        writer.println("=== Linux Process Memory Info ===");
+
+        try {
+            // Read /proc/<pid>/status for VmPeak, VmSize, VmRSS, etc.
+            String statusFile = "/proc/" + pid + "/status";
+            ProcessBuilder pb = new ProcessBuilder("grep", "-E",
+                    "VmPeak|VmSize|VmRSS|VmHWM|VmData|VmStk|VmExe|VmLib|Threads", statusFile);
+            Process process = pb.start();
+
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (line.contains("VmPeak")) {
+                        writer.println("Peak Virtual Memory: " + formatLinuxMemory(line));
+                    } else if (line.contains("VmSize")) {
+                        writer.println("Current Virtual Memory: " + formatLinuxMemory(line));
+                    } else if (line.contains("VmRSS")) {
+                        writer.println("Resident Set Size: " + formatLinuxMemory(line));
+                    } else if (line.contains("VmHWM")) {
+                        writer.println("Peak Resident Memory: " + formatLinuxMemory(line));
+                    } else if (line.contains("VmData")) {
+                        writer.println("Data Segment Size: " + formatLinuxMemory(line));
+                    } else if (line.contains("VmStk")) {
+                        writer.println("Stack Size: " + formatLinuxMemory(line));
+                    } else if (line.contains("Threads")) {
+                        writer.println("Thread Count: " + line.split("\\s+")[1]);
+                    }
+                }
+            }
+
+            process.waitFor();
+
+        } catch (Exception e) {
+            writer.println("Error reading Linux process status: " + e.getMessage());
+        }
+
+        writer.println();
+        writer.println("=== Linux System Limits ===");
+        try {
+            String maxMapCount = readLinuxSysctl("/proc/sys/vm/max_map_count");
+            if (maxMapCount != null) {
+                writer.println("System Max Memory Maps: " + maxMapCount);
+            }
+
+            String maxFiles = readLinuxSysctl("/proc/sys/fs/file-max");
+            if (maxFiles != null) {
+                writer.println("System Max File Descriptors: " + maxFiles);
+            }
+
+            String openFiles = readLinuxSysctl("/proc/sys/fs/file-nr");
+            if (openFiles != null) {
+                String[] parts = openFiles.split("\\s+");
+                if (parts.length >= 2) {
+                    writer.println("System Open Files: " + parts[0] + " (allocated: " + parts[1] + ")");
+                }
+            }
+
+        } catch (Exception e) {
+            writer.println("Error reading Linux system limits: " + e.getMessage());
+        }
+
+        writer.println();
+    }
+
+    private static void captureMacSystemInfoToFile(PrintWriter writer) {
+        writer.println("=== macOS System Info ===");
+
+        try {
+            ProcessBuilder pb = new ProcessBuilder("vm_stat");
+            Process process = pb.start();
+
+            writer.println("VM Statistics:");
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    writer.println("  " + line.trim());
+                }
+            }
+
+            process.waitFor();
+
+        } catch (Exception e) {
+            writer.println("Error reading macOS system info: " + e.getMessage());
+        }
+
+        writer.println();
+    }
+
+    private static void captureVmmapToFile(PrintWriter writer, String label) {
+        writer.println("=== " + label + " ===");
+
+        try {
+            ProcessBuilder pb;
+            String commandDescription;
+
+            if (IS_MAC) {
+                pb = new ProcessBuilder("bash", "-c", "vmmap --wide " + pid + " | grep '_1q_Lucene101_0'");
+                commandDescription = "vmmap (macOS)";
+            } else if (IS_LINUX) {
+                pb = new ProcessBuilder("bash", "-c", "cat /proc/" + pid + "/maps | grep '_1q_Lucene101_0'");
+                commandDescription = "proc/maps (Linux)";
+            } else {
+                writer.println("Memory mapping inspection not supported on " + OS_NAME);
+                return;
+            }
+
+            Process process = pb.start();
+            int mappingCount = 0;
+
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    mappingCount++;
+                    writer.println(line);
+                }
+            }
+
+            writer.println();
+            writer.println("Total mappings found: " + mappingCount);
+            writer.println("Command used: " + commandDescription);
+
+            process.waitFor();
+
+        } catch (Exception e) {
+            writer.println("Error executing memory mapping command: " + e.getMessage());
+        }
+
+        writer.println();
+    }
+
+    private static void captureProcessMemoryMapToFile(PrintWriter writer, String label) {
+        writer.println("=== " + label + " ===");
+
+        try {
+            ProcessBuilder pb;
+            String commandDescription;
+
+            if (IS_LINUX) {
+                // Use pmap -x for detailed Linux memory map
+                pb = new ProcessBuilder("pmap", "-x", String.valueOf(pid));
+                commandDescription = "pmap -x (Linux)";
+            } else if (IS_MAC) {
+                // Use vmmap for detailed macOS memory map
+                pb = new ProcessBuilder("vmmap", "--wide", String.valueOf(pid));
+                commandDescription = "vmmap --wide (macOS)";
+            } else {
+                writer.println("Process memory map not supported on " + OS_NAME);
+                return;
+            }
+
+            Process process = pb.start();
+
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    writer.println(line);
+                }
+            }
+
+            // Also capture any errors
+            try (BufferedReader errorReader = new BufferedReader(new InputStreamReader(process.getErrorStream()))) {
+                String errorLine;
+                boolean hasErrors = false;
+                while ((errorLine = errorReader.readLine()) != null) {
+                    if (!hasErrors) {
+                        writer.println("Command errors:");
+                        hasErrors = true;
+                    }
+                    writer.println("ERROR: " + errorLine);
+                }
+            }
+
+            writer.println();
+            writer.println("Command used: " + commandDescription);
+
+            process.waitFor();
+
+        } catch (Exception e) {
+            writer.println("Error executing process memory map command: " + e.getMessage());
+        }
+
+        writer.println();
+    }
+
+    private static void captureFileDescriptorInfoToFile(PrintWriter writer, String label) {
+        writer.println("=== " + label + " ===");
+
+        if (IS_LINUX) {
+            try {
+                // Count current file descriptors
+                String fdDir = "/proc/" + pid + "/fd";
+                ProcessBuilder pb = new ProcessBuilder("ls", "-la", fdDir);
+                Process process = pb.start();
+
+                writer.println("File Descriptors (/proc/" + pid + "/fd):");
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        writer.println(line);
+                    }
+                }
+
+                process.waitFor();
+
+            } catch (Exception e) {
+                writer.println("Error reading Linux file descriptor info: " + e.getMessage());
+            }
+
+        } else if (IS_MAC) {
+            try {
+                ProcessBuilder pb = new ProcessBuilder("lsof", "-p", String.valueOf(pid));
+                Process process = pb.start();
+
+                writer.println("Open Files (lsof -p " + pid + "):");
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        writer.println(line);
+                    }
+                }
+
+                process.waitFor();
+
+            } catch (Exception e) {
+                writer.println("Error reading macOS file descriptor info: " + e.getMessage());
+            }
+        }
+
+        writer.println();
+    }
+
+    private static void captureSystemLimitsToFile(PrintWriter writer, String label) {
+        writer.println("=== " + label + " ===");
+
+        if (IS_LINUX) {
+            try {
+                String limitsFile = "/proc/" + pid + "/limits";
+                ProcessBuilder pb = new ProcessBuilder("cat", limitsFile);
+                Process process = pb.start();
+
+                writer.println("Process Limits (/proc/" + pid + "/limits):");
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        writer.println(line);
+                    }
+                }
+
+                process.waitFor();
+
+            } catch (Exception e) {
+                writer.println("Error reading Linux process limits: " + e.getMessage());
+            }
+        } else if (IS_MAC) {
+            try {
+                ProcessBuilder pb = new ProcessBuilder("ulimit", "-a");
+                Process process = pb.start();
+
+                writer.println("Process Limits (ulimit -a):");
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        writer.println(line);
+                    }
+                }
+
+                process.waitFor();
+
+            } catch (Exception e) {
+                writer.println("Error reading macOS process limits: " + e.getMessage());
+            }
+        }
+
+        writer.println();
+    }
+
 }
 
 class ExceptionInfo {
